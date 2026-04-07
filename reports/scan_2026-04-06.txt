@@ -1,0 +1,74 @@
+Mantis Daily Scan Report
+Date: 2026-04-06  Time: 09:35 UTC
+Capital: $100
+Mode: REWARD FARMING (tight spread, min_size)
+Viable markets found: 1144
+
+Top 15 markets (sorted by $/capital):
+
+    #   Est $/d     Pool    $/cap    Cap $       Q   Spread  Market
+  ----------------------------------------------------------------------------------------------------
+    1  $ 93.41  $104.0     2.22  $ 42.0       5    4.0c  Will the highest temperature in Ankara be 16°
+    2  $ 44.53  $ 46.0     2.12  $ 21.0       2    4.0c  Will the highest temperature in Ankara be 17°
+    3  $ 45.03  $ 46.0     1.96  $ 22.9       1   13.5c  Will the DHS shutdown end between April 13-16
+    4  $ 57.28  $ 74.0     1.88  $ 30.5      14    3.0c  Will the highest temperature in London be 15°
+    5  $ 96.35  $113.0     1.84  $ 52.5       8    3.0c  Will the highest temperature in London be 16°
+    6  $ 29.37  $ 30.0     1.74  $ 16.9       1   17.6c  Will Israel conduct military action in Greate
+    7  $ 25.47  $ 27.0     1.51  $ 16.9       3    5.8c  Will the DHS shutdown end between April 17-20
+    8  $ 64.61  $116.0     1.49  $ 43.5      37    1.0c  Will the highest temperature in New York City
+    9  $ 19.64  $ 24.0     1.12  $ 17.6       4    6.0c  Will Kareem Allam win the 2026 Vancouver mayo
+   10  $  9.48  $ 10.0     1.05  $  9.0       1   33.0c  Will The Left (Levica) be part of the next Go
+   11  $  9.48  $ 10.0     1.05  $  9.0       1   19.0c  Will Trump say "UFC" during the White House E
+   12  $  5.69  $  6.0     0.91  $  6.2       1   30.8c  Will Alejandro Mostajo Rueda win the 2026 Coc
+   13  $  9.45  $ 10.0     0.91  $ 10.4       1    6.0c  Will Trump say "Construction" during the Whit
+   14  $ 13.21  $ 23.0     0.87  $ 15.2      13    4.0c  Will CZ post 0-19 posts from April 3 to April
+   15  $ 24.77  $ 30.0     0.84  $ 29.5       4    6.7c  Will 45 or more ships transit the Strait of H
+
+Details (Top 5):
+
+  #1: Will the highest temperature in Ankara be 16°C on April 6?
+      Mid: 0.420  Spread: 4.0c
+      Reward pool: $104/day  Max spread: 4.5c
+      Min size: 50  Total Q: 5
+      $/Q: 19.5907  Est daily: $93.41
+      Bid depth (5 lvl): 138  Ask depth (5 lvl): 129
+      Your depth share: 26.5%
+      Capital needed: $42.0  $/capital: 2.22
+
+  #2: Will the highest temperature in Ankara be 17°C on April 6?
+      Mid: 0.210  Spread: 4.0c
+      Reward pool: $46/day  Max spread: 4.5c
+      Min size: 50  Total Q: 2
+      $/Q: 29.8080  Est daily: $44.53
+      Bid depth (5 lvl): 79  Ask depth (5 lvl): 44
+      Your depth share: 38.8%
+      Capital needed: $21.0  $/capital: 2.12
+
+  #3: Will the DHS shutdown end between April 13-16, 2026?
+      Mid: 0.229  Spread: 13.5c
+      Reward pool: $46/day  Max spread: 3.5c
+      Min size: 50  Total Q: 1
+      $/Q: 46.0000  Est daily: $45.03
+      Bid depth (5 lvl): 527  Ask depth (5 lvl): 112
+      Your depth share: 8.7%
+      Capital needed: $22.9  $/capital: 1.96
+
+  #4: Will the highest temperature in London be 15°C on April 6?
+      Mid: 0.305  Spread: 3.0c
+      Reward pool: $74/day  Max spread: 4.5c
+      Min size: 50  Total Q: 14
+      $/Q: 5.4097  Est daily: $57.28
+      Bid depth (5 lvl): 246  Ask depth (5 lvl): 325
+      Your depth share: 16.9%
+      Capital needed: $30.5  $/capital: 1.88
+
+  #5: Will the highest temperature in London be 16°C on April 6?
+      Mid: 0.525  Spread: 3.0c
+      Reward pool: $113/day  Max spread: 4.5c
+      Min size: 50  Total Q: 8
+      $/Q: 13.9581  Est daily: $96.35
+      Bid depth (5 lvl): 188  Ask depth (5 lvl): 73
+      Your depth share: 21.0%
+      Capital needed: $52.5  $/capital: 1.84
+
+Estimated daily income (top 2 markets): $137.95

@@ -1,0 +1,63 @@
+graph TD
+    subgraph 数据层
+        API1[CLOB API<br/>sampling-markets]
+        API2[Gamma API<br/>volume/spread]
+        API3[Data API<br/>trades]
+        OB[Orderbook<br/>实时订单簿]
+    end
+
+    subgraph 扫描器 Scanner
+        S1[基础过滤<br/>price 0.15-0.85<br/>min_size ≤ 50<br/>daily_rate ≥ $1]
+        S2[Q竞争过滤<br/>Q > 300 跳过<br/>spread > 10c 跳过]
+        S3[排名<br/>reward_per_capital<br/>gm_reward_per_100]
+    end
+
+    subgraph 引擎 Engine
+        E1[defiance_cr 报价<br/>距离 = 15% × max_spread<br/>Q系数 72%]
+        E2[订单簿倾斜检测<br/>bid/ask深度比<br/>偏移30%半价差]
+        E3[挂单管理<br/>min_size 双边挂单<br/>30s刷新周期]
+        E4[填单同步<br/>确认成交 vs 取消<br/>更新持仓]
+        E5[止盈逻辑<br/>浮盈 ≥ 2%<br/>自动平仓]
+    end
+
+    subgraph 风控 Risk
+        R1[回撤控制<br/>max 15%<br/>超限暂停24h]
+        R2[日亏损限制<br/>max $3/天]
+        R3[波动率门控<br/>3h vol > 8%<br/>价差翻倍]
+        R4[结算保护<br/>48h前撤单]
+        R5[填单冷却<br/>60s/侧]
+    end
+
+    subgraph 资金管理
+        C1[总资金 $100]
+        C2[分配 5个市场<br/>30/25/20/15/10%]
+        C3[库存限制<br/>单侧 ≤ 60%<br/>紧急 80% 暂停]
+    end
+
+    API1 --> S1
+    API2 --> S1
+    S1 --> S2
+    S2 --> S3
+    S3 -->|Top 5 市场| C2
+
+    OB --> E1
+    OB --> E2
+    E2 --> E1
+    E1 --> E3
+    API3 --> E4
+    E4 -->|持仓变化| E5
+    E4 -->|触发| R5
+
+    C2 --> E3
+    R1 --> E3
+    R2 --> E3
+    R3 -->|spread×2| E1
+    R4 --> E3
+    R5 --> E3
+    C3 --> E3
+
+    style E1 fill:#0d4f8b,stroke:#00d4ff,color:#fff
+    style R3 fill:#8b2500,stroke:#f85149,color:#fff
+    style R5 fill:#8b2500,stroke:#f85149,color:#fff
+    style S2 fill:#2d5016,stroke:#3fb950,color:#fff
+    style E5 fill:#4a2080,stroke:#a371f7,color:#fff

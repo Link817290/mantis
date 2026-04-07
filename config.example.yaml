@@ -1,0 +1,41 @@
+# Mantis - Polymarket Market Maker Configuration
+
+capital: 100  # Total capital in USDC
+
+wallet:
+  private_key: ""  # Your Polygon wallet private key
+  # NEVER commit this file with your real key!
+  # Use .env file or environment variable MANTIS_PRIVATE_KEY instead
+
+markets:
+  max_active: 2            # Max markets to run simultaneously
+  allocation: [60, 40]     # Capital split (%) across active markets
+  scan_interval_min: 60    # How often to scan for better markets
+
+scanner:
+  min_reward_per_q: 0.025  # Minimum reward/Q ratio to consider
+  min_price: 0.15          # YES price lower bound
+  max_price: 0.85          # YES price upper bound
+  max_min_size: 50         # Max acceptable min_size for orders
+  min_reward_rate: 1.0     # Min daily reward rate in USDC
+  migrate_threshold: 1.5   # Switch market if new one is 50% better
+
+engine:
+  default_half_spread: 0.005   # 0.5c default half-spread
+  min_half_spread: 0.003       # 0.3c minimum (safety floor)
+  reprice_threshold: 0.005     # Only reprice if change > 0.5c
+  order_refresh_sec: 60        # Check/refresh orders every N seconds
+  markov_window: 20            # Price history window for Markov
+  gm_lookback_fills: 50        # Recent fills for Glosten-Milgrom
+
+risk:
+  max_drawdown: 0.15           # 15% max drawdown from peak
+  daily_loss_limit: 3.0        # $3 daily loss limit
+  max_inventory_ratio: 0.6     # 60% max single-side position
+  emergency_inventory: 0.8     # 80% triggers pause on that side
+  settlement_buffer_hours: 48  # Pull orders N hours before settlement
+
+cfr:
+  enabled: true
+  strategies: [0.005, 0.008, 0.012]  # half-spread options
+  update_interval_hours: 24          # Update weights daily

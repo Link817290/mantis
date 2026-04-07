@@ -1,0 +1,11 @@
+config.yaml
+.env
+*.db
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+.secrets/
+ref/
+data/
