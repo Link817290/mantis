@@ -57,7 +57,10 @@ class Mantis:
 
         # Timing
         self._last_scan = 0.0
+        self._last_quick_scan = 0.0
         self._last_daily_reset = ""
+        self._last_heartbeat = 0.0
+        self._heartbeat_interval = 30.0  # 每30秒发送一次心跳
 
         # Sync positions from chain on startup
         self._sync_positions_from_chain()
@@ -138,15 +141,27 @@ class Mantis:
         """One iteration of the main loop."""
         now = time.time()
 
+        # 心跳：防止订单被自动取消（每30秒）
+        if self.trader and now - self._last_heartbeat >= self._heartbeat_interval:
+            if self.trader.send_heartbeat():
+                logger.debug("Heartbeat sent")
+            else:
+                logger.warning("Heartbeat failed - orders may be cancelled!")
+            self._last_heartbeat = now
+
         # Daily reset check
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self._last_daily_reset:
             self._daily_reset(today)
 
-        # Periodic market scan
+        # Periodic market scan (full scan every 10 min, quick scan every 5 min)
         scan_interval = self.config.markets.scan_interval_min * 60
+        quick_scan_interval = self.config.markets.quick_scan_interval_min * 60
+
         if now - self._last_scan >= scan_interval:
             self._scan_and_select()
+        elif now - self._last_quick_scan >= quick_scan_interval:
+            self._quick_opportunity_check()
 
         # Update aggregate daily P&L before risk checks
         if self.states:
@@ -188,14 +203,34 @@ class Mantis:
                             state.orderbook, state.market.rewards.max_spread,
                         )
                         state.total_q_min = total_q
+                        old_rpq = state.reward_per_q
                         state.reward_per_q = (
                             state.market.rewards.daily_rate / total_q
                             if total_q > 0 else 0
                         )
+                        # If reward dropped significantly, trigger migration check
+                        if old_rpq > 0 and state.reward_per_q < old_rpq * 0.5:
+                            logger.warning(
+                                f"Reward dropped {old_rpq:.4f} -> {state.reward_per_q:.4f}, "
+                                f"triggering migration check"
+                            )
+                            needs_rescan = True
+
+            # Check if quality monitor flagged for exit
+            if state.marked_for_exit and not state.unwind_only:
+                logger.warning(
+                    f"Quality monitor flagged {state.market.question[:30]} for migration "
+                    f"(quality={state.quality_score:.2f})"
+                )
+                needs_rescan = True
 
         # Deferred rescan (outside iteration loop)
         if needs_rescan:
             self._scan_and_select()
+
+        # Process pending price trajectory checks for adverse selection analysis
+        states_by_cid = {s.market.condition_id: s for s in self.states}
+        self.engine._process_trajectory_checks(states_by_cid)
 
         # Status log
         self._log_status()
@@ -217,6 +252,36 @@ class Mantis:
         )
         return available
 
+    def _quick_opportunity_check(self):
+        """Quick check for better market opportunities between full scans."""
+        self._last_quick_scan = time.time()
+
+        current_ids = {s.market.condition_id for s in self.states}
+        if not current_ids:
+            return  # No active markets, wait for full scan
+
+        # Get current best RPC for comparison
+        current_best_rpc = 0.0
+        if self.states:
+            for s in self.states:
+                if s.reward_per_q > 0 and s.total_q_min > 0:
+                    est_rpc = (s.market.rewards.daily_rate * s.reward_per_q) / (
+                        s.market.rewards.min_size * 0.5 * 2
+                    )
+                    current_best_rpc = max(current_best_rpc, est_rpc)
+
+        # Quick scan for opportunities
+        opportunities = self.scanner.quick_scan(current_ids)
+
+        # If found significantly better opportunity, trigger full scan
+        for cid, est_rpc in opportunities:
+            if est_rpc > current_best_rpc * 1.3:  # 30% better
+                logger.info(
+                    f"Quick scan found opportunity: RPC ${est_rpc:.4f} vs current ${current_best_rpc:.4f}"
+                )
+                self._scan_and_select()
+                return
+
     def _scan_and_select(self):
         """Scan markets and select best ones.
 
@@ -224,6 +289,7 @@ class Mantis:
         Remaining slots go to highest-reward markets.
         """
         self._last_scan = time.time()
+        self._last_quick_scan = time.time()  # Reset quick scan timer too
 
         # Pass position CIDs to scanner so those markets bypass filters
         position_cids = {p["condition_id"] for p in self.db.get_all_positions()}
@@ -322,10 +388,55 @@ class Mantis:
                     f"(${capital:.0f}, ${result.estimated_daily_reward:.2f}/day est)"
                 )
 
-        # Cancel orders for markets we're leaving
+        # Handle markets we're leaving
         leaving = current_ids - {s.market.condition_id for s in new_states}
         for s in self.states:
             if s.market.condition_id in leaving:
+                # Check if we have positions and their P&L
+                has_position = any(p.size > 0 for p in s.positions)
+
+                if has_position and s.orderbook:
+                    # Calculate position P&L
+                    mid = s.orderbook.midpoint
+                    position_pnl = 0.0
+                    for pos in s.positions:
+                        if pos.size > 0:
+                            if pos.outcome == "Yes":
+                                position_pnl += pos.size * (mid - pos.avg_cost)
+                            else:  # No
+                                position_pnl += pos.size * ((1 - mid) - pos.avg_cost)
+
+                    position_value = sum(
+                        p.size * (mid if p.outcome == "Yes" else 1 - mid)
+                        for p in s.positions if p.size > 0
+                    )
+                    pnl_pct = position_pnl / position_value if position_value > 0 else 0
+
+                    if pnl_pct < -0.01:  # Losing more than 1%
+                        # Don't exit - enter unwind_only mode
+                        logger.warning(
+                            f"Position in {s.market.question[:30]} is losing {pnl_pct:.1%}, "
+                            f"entering unwind-only mode"
+                        )
+                        s.unwind_only = True
+                        s.unwind_start_time = time.time()
+                        s.marked_for_exit = True
+                        # Keep this market in states for unwinding
+                        new_states.append(s)
+                        slog.market_exit(
+                            market=s.market.question[:40],
+                            condition_id=s.market.condition_id,
+                            reason="unwind_only_mode",
+                        )
+                        continue
+                    else:
+                        # Profitable or small loss - can exit
+                        logger.info(
+                            f"Position in {s.market.question[:30]} is {pnl_pct:+.1%}, "
+                            f"closing and migrating"
+                        )
+
+                # No position or profitable - clean exit
                 logger.info(f"Leaving market: {s.market.question[:40]}")
                 slog.market_exit(
                     market=s.market.question[:40],
@@ -406,6 +517,14 @@ class Mantis:
 
         # Save CFR state
         self.engine.save_cfr_state()
+
+        # Clean up old database records (keep 30 days)
+        try:
+            deleted = self.db.cleanup_old_data(days=30)
+            if deleted > 0:
+                logger.info(f"Database cleanup: removed {deleted} old records")
+        except Exception as e:
+            logger.warning(f"Database cleanup failed: {e}")
 
         # Reset risk manager daily counters
         self.risk.reset_daily(self.config.capital)

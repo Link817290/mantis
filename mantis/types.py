@@ -149,6 +149,18 @@ class MarketState:
     last_fill_time: float = 0.0
     volatility_3h: float = 0.0  # rolling 3h price volatility
     orders_cleaned_up: bool = False  # True after initial stale order cleanup
+    # Migration/unwind mode
+    unwind_only: bool = False  # True = only place orders to close positions, no new exposure
+    unwind_start_time: float = 0.0  # When unwind mode started
+    marked_for_exit: bool = False  # True = should exit when position closed
+    # Real-time quality tracking
+    quality_score: float = 1.0  # Current composite quality (0-1)
+    activity_score: float = 1.0
+    vpin_score: float = 1.0
+    volatility_score: float = 1.0
+    quality_trend: float = 0.0  # Positive = improving, negative = deteriorating
+    last_quality_update: float = 0.0
+    recent_trades: list = field(default_factory=list)  # For VPIN/vol calculation
 
 
 @dataclass
@@ -164,3 +176,11 @@ class ScanResult:
     your_depth_share: float
     capital_needed: float = 0.0  # Capital locked for min_size on both sides
     reward_per_capital: float = 0.0  # est_daily / capital_needed
+    # Quality metrics
+    activity_score: float = 0.0
+    fill_prob_score: float = 0.0
+    volatility_score: float = 0.0
+    vpin_score: float = 0.0
+    price_score: float = 0.0
+    quality_score: float = 0.0  # composite quality
+    risk_adjusted_reward: float = 0.0  # reward_per_capital * quality_score

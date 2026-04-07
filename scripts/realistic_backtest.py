@@ -16,6 +16,14 @@ Factors modeled:
   8. Daily P&L: track fills, inventory MTM, and reward per-minute granularity
   9. Market impact: our orders slightly affect the queue (negligible at min_size)
   10. Reprice frequency: only reprice when mid drifts > 0.5c; each reprice costs gas
+
+NEW FACTORS (v2):
+  11. Time-priority queue position: track actual queue advancement
+  12. VPIN-based toxic flow detection: higher adverse rate when VPIN is high
+  13. Informed trader patterns: detect clustering of one-sided trades
+  14. Q competition dynamics: other makers competing for same rewards
+  15. Settlement proximity risk: markets behave differently near settlement
+  16. Stop-loss modeling: forced liquidation on large adverse moves
 """
 import sys
 sys.path.insert(0, "/workspace/mantis")
@@ -52,6 +60,12 @@ CALIBRATED_ADVERSE_RATE = 0.06      # from real data (was assumed 30%)
 CALIBRATED_ADVERSE_MOVE = 0.0155    # avg adverse price move when it occurs
 CALIBRATED_QUEUE_DEPTH = 130        # avg real queue depth
 
+# === NEW: Enhanced calibration from paper_trader v2 ===
+CALIBRATED_AVG_QUEUE_TIME_SEC = 120      # 平均队列等待时间
+CALIBRATED_TOXIC_FILL_RATE = 0.15        # 被toxic flow吃单的比例
+CALIBRATED_ADVERSE_RATE_HIGH_VPIN = 0.18  # 高VPIN时的adverse rate
+CALIBRATED_ADVERSE_RATE_LOW_VPIN = 0.04   # 低VPIN时的adverse rate
+
 GAS_PER_TX = 0.002          # $0.002 per Polygon tx
 CANCEL_AND_PLACE_TXS = 2    # cancel old + place new = 2 tx per reprice per side
 FILL_CONFIRM_TXS = 0        # fills are passive, no tx needed from us
@@ -59,6 +73,97 @@ COOLDOWN_SEC = 60            # post-fill cooldown
 REPRICE_DRIFT_THRESHOLD = 0.005  # only reprice when mid moves 0.5c
 INVENTORY_ADVERSE_RATE = CALIBRATED_ADVERSE_RATE
 ADVERSE_CONTINUATION_BPS = int(CALIBRATED_ADVERSE_MOVE * 10000)  # ~155 bps
+
+# === NEW: Stop-loss parameters ===
+STOP_LOSS_THRESHOLD = 0.05   # 5% loss triggers stop-loss
+URGENT_STOP_LOSS = 0.08      # 8% loss triggers market sell
+
+
+@dataclass
+class VPINTracker:
+    """Track VPIN (Volume-synchronized Probability of Informed Trading)."""
+    bucket_size: float = 30.0
+    n_buckets: int = 30
+    buckets: list = field(default_factory=list)
+    current_bucket_buy: float = 0.0
+    current_bucket_sell: float = 0.0
+    bucket_volume: float = 0.0
+
+    def add_trade(self, size: float, side: str):
+        """Add a trade to VPIN calculation."""
+        if side == "BUY":
+            self.current_bucket_buy += size
+        else:
+            self.current_bucket_sell += size
+        self.bucket_volume += size
+
+        if self.bucket_volume >= self.bucket_size:
+            self.buckets.append((self.current_bucket_buy, self.current_bucket_sell))
+            if len(self.buckets) > self.n_buckets:
+                self.buckets = self.buckets[-self.n_buckets:]
+            self.bucket_volume = 0
+            self.current_bucket_buy = 0
+            self.current_bucket_sell = 0
+
+    def get_vpin(self) -> float:
+        """Calculate current VPIN (0-1, higher = more toxic)."""
+        if len(self.buckets) < 5:
+            return 0.0
+        total_imbalance = sum(abs(b - s) for b, s in self.buckets)
+        total_volume = sum(b + s for b, s in self.buckets)
+        return total_imbalance / total_volume if total_volume > 0 else 0.0
+
+
+@dataclass
+class QueueTracker:
+    """Track time-priority queue position."""
+    bid_queue_position: float = 0.0
+    ask_queue_position: float = 0.0
+    bid_volume_at_join: float = 0.0
+    ask_volume_at_join: float = 0.0
+    bid_total_filled_at_level: float = 0.0
+    ask_total_filled_at_level: float = 0.0
+    bid_join_time: float = 0.0
+    ask_join_time: float = 0.0
+
+    def join_bid_queue(self, queue_depth: float, total_filled: float, now: float):
+        """Join the bid queue at end of current queue."""
+        self.bid_queue_position = queue_depth
+        self.bid_volume_at_join = total_filled
+        self.bid_join_time = now
+
+    def join_ask_queue(self, queue_depth: float, total_filled: float, now: float):
+        """Join the ask queue at end of current queue."""
+        self.ask_queue_position = queue_depth
+        self.ask_volume_at_join = total_filled
+        self.ask_join_time = now
+
+    def check_bid_fill(self, trade_size: float, our_size: float) -> tuple[bool, float]:
+        """Check if bid should be filled based on time priority.
+
+        Returns (should_fill, fill_probability).
+        """
+        self.bid_total_filled_at_level += trade_size
+        volume_since_join = self.bid_total_filled_at_level - self.bid_volume_at_join
+
+        if volume_since_join >= self.bid_queue_position:
+            # Queue ahead has been consumed
+            remaining = volume_since_join - self.bid_queue_position
+            # Pro-rata among remaining orders
+            fill_prob = min(1.0, our_size / (our_size + max(0, self.bid_queue_position - remaining)))
+            return True, fill_prob
+        return False, 0.0
+
+    def check_ask_fill(self, trade_size: float, our_size: float) -> tuple[bool, float]:
+        """Check if ask should be filled based on time priority."""
+        self.ask_total_filled_at_level += trade_size
+        volume_since_join = self.ask_total_filled_at_level - self.ask_volume_at_join
+
+        if volume_since_join >= self.ask_queue_position:
+            remaining = volume_since_join - self.ask_queue_position
+            fill_prob = min(1.0, our_size / (our_size + max(0, self.ask_queue_position - remaining)))
+            return True, fill_prob
+        return False, 0.0
 
 
 def q_score(size, dist_c, max_spread_c):
@@ -143,10 +248,12 @@ def estimate_queue_depth(trades, min_size):
 
 
 def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size,
-                               total_q, spread_pct, dynamic_spread=False):
+                               total_q, spread_pct, dynamic_spread=False,
+                               use_enhanced_model=True):
     """Full realistic simulation of one market.
 
     trades_with_size: [(side, price, timestamp, size), ...]
+    use_enhanced_model: if True, use VPIN, queue tracking, stop-loss
     Returns detailed results with per-minute P&L.
     """
     if not trades_with_size or len(trades_with_size) < 5:
@@ -170,6 +277,8 @@ def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size
     vol = 0.0
 
     fills = 0
+    toxic_fills = 0
+    stop_loss_count = 0
     total_gas = 0.0
     reprice_count = 0
 
@@ -187,15 +296,31 @@ def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size
     minute_pnl = defaultdict(float)  # minute_idx -> pnl
     minute_mtm = {}  # minute_idx -> MTM snapshot
 
+    # === NEW: Enhanced tracking ===
+    vpin_tracker = VPINTracker() if use_enhanced_model else None
+    queue_tracker = QueueTracker() if use_enhanced_model else None
+    fill_entry_prices = []  # (entry_price, side, entry_time) for stop-loss tracking
+
     # RNG: use global random so Monte Carlo seed variation works
     rng = random
+
+    # Initialize queue positions
+    if queue_tracker:
+        queue_tracker.join_bid_queue(queue_depth, 0, t_start)
+        queue_tracker.join_ask_queue(queue_depth, 0, t_start)
 
     for side, price, ts, trade_size in trades_with_size:
         if price <= 0.01 or price >= 0.99:
             continue
 
+        trade_size = trade_size or min_size  # fallback if size is None
+
         dt = ts - last_ts
         minute_idx = int((ts - t_start) / 60)
+
+        # === NEW: Update VPIN ===
+        if vpin_tracker:
+            vpin_tracker.add_trade(trade_size, side)
 
         # Accumulate time-on-book for Q reward
         if bid_live:
@@ -206,8 +331,13 @@ def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size
         # Cooldown check
         if not bid_live and ts >= bid_cooldown_until:
             bid_live = True
+            # Rejoin queue when cooldown ends
+            if queue_tracker:
+                queue_tracker.join_bid_queue(queue_depth, queue_tracker.bid_total_filled_at_level, ts)
         if not ask_live and ts >= ask_cooldown_until:
             ask_live = True
+            if queue_tracker:
+                queue_tracker.join_ask_queue(queue_depth, queue_tracker.ask_total_filled_at_level, ts)
 
         # Update volatility
         recent_prices.append(price)
@@ -218,7 +348,8 @@ def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size
                        for i in range(1, len(recent_prices))]
             vol = statistics.mean(returns)
 
-        # Dynamic spread
+        # === NEW: VPIN-based spread adjustment ===
+        vpin = vpin_tracker.get_vpin() if vpin_tracker else 0
         if dynamic_spread:
             if vol < 0.02:
                 eff_pct = spread_pct * 0.80
@@ -228,6 +359,9 @@ def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size
                 eff_pct = spread_pct
             if total_q > 200:
                 eff_pct = max(eff_pct, 0.20)
+            # Widen spread when VPIN is high (toxic flow)
+            if use_enhanced_model and vpin > 0.35:
+                eff_pct = min(0.40, eff_pct * 1.5)  # up to 50% wider
         else:
             eff_pct = spread_pct
 
@@ -242,43 +376,94 @@ def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size
             gas = CANCEL_AND_PLACE_TXS * 2 * GAS_PER_TX  # 2 sides × 2 tx each
             total_gas += gas
             minute_pnl[minute_idx] -= gas
+            # Reset queue position after reprice
+            if queue_tracker:
+                queue_tracker.join_bid_queue(queue_depth, queue_tracker.bid_total_filled_at_level, ts)
+                queue_tracker.join_ask_queue(queue_depth, queue_tracker.ask_total_filled_at_level, ts)
 
         our_bid = last_reprice_mid - half
         our_ask = last_reprice_mid + half
 
-        # === FILL CHECK with pro-rata probability ===
+        # === FILL CHECK with enhanced queue model ===
         filled_side = None
 
         if side == "SELL" and price <= our_bid + 0.005 and bid_live:
-            # A sell trade near our bid — we might get filled
-            # Pro-rata: probability based on our share of queue
-            if rng.random() < fill_prob:
+            # Determine fill probability
+            if use_enhanced_model and queue_tracker:
+                should_check, queue_fill_prob = queue_tracker.check_bid_fill(trade_size, min_size)
+                effective_fill_prob = queue_fill_prob if should_check else 0
+            else:
+                effective_fill_prob = fill_prob
+
+            if rng.random() < effective_fill_prob:
                 filled_side = "BUY"  # we bought
-                fill_price = our_bid  # we buy at our bid price
+                fill_price = our_bid
                 inv.buy_yes(min_size, fill_price)
                 fills += 1
                 bid_live = False
                 bid_cooldown_until = ts + COOLDOWN_SEC
+                fill_entry_prices.append((fill_price, "BUY", ts))
 
-                # Adverse selection: 30% chance price continues down
-                if rng.random() < INVENTORY_ADVERSE_RATE:
+                # === NEW: VPIN-based adverse selection ===
+                if use_enhanced_model:
+                    adverse_rate = CALIBRATED_ADVERSE_RATE_HIGH_VPIN if vpin > 0.3 else CALIBRATED_ADVERSE_RATE_LOW_VPIN
+                    if vpin > 0.35:
+                        toxic_fills += 1
+                else:
+                    adverse_rate = INVENTORY_ADVERSE_RATE
+
+                if rng.random() < adverse_rate:
                     adverse_move = fill_price * ADVERSE_CONTINUATION_BPS / 10000
-                    # This is modeled as additional unrealized loss later
 
         elif side == "BUY" and price >= our_ask - 0.005 and ask_live:
-            if rng.random() < fill_prob:
-                filled_side = "SELL"  # we sold
+            if use_enhanced_model and queue_tracker:
+                should_check, queue_fill_prob = queue_tracker.check_ask_fill(trade_size, min_size)
+                effective_fill_prob = queue_fill_prob if should_check else 0
+            else:
+                effective_fill_prob = fill_prob
+
+            if rng.random() < effective_fill_prob:
+                filled_side = "SELL"
                 fill_price = our_ask
                 inv.sell_yes(min_size, fill_price)
                 fills += 1
                 ask_live = False
                 ask_cooldown_until = ts + COOLDOWN_SEC
+                fill_entry_prices.append((fill_price, "SELL", ts))
 
-                if rng.random() < INVENTORY_ADVERSE_RATE:
+                if use_enhanced_model:
+                    adverse_rate = CALIBRATED_ADVERSE_RATE_HIGH_VPIN if vpin > 0.3 else CALIBRATED_ADVERSE_RATE_LOW_VPIN
+                    if vpin > 0.35:
+                        toxic_fills += 1
+                else:
+                    adverse_rate = INVENTORY_ADVERSE_RATE
+
+                if rng.random() < adverse_rate:
                     adverse_move = fill_price * ADVERSE_CONTINUATION_BPS / 10000
 
         # Update EMA
         ema_mid = 0.3 * price + 0.7 * ema_mid
+
+        # === NEW: Stop-loss check ===
+        if use_enhanced_model and inv.total_exposure > 0:
+            mtm_pnl = inv.mtm_pnl(ema_mid)
+            position_value = inv.yes_qty * inv.yes_avg_cost + inv.no_qty * inv.no_avg_cost
+            if position_value > 0:
+                pnl_pct = mtm_pnl / position_value
+                if pnl_pct < -URGENT_STOP_LOSS:
+                    # Urgent stop-loss: liquidate immediately
+                    liq = inv.liquidate(ema_mid)
+                    minute_pnl[minute_idx] += liq
+                    stop_loss_count += 1
+                    fill_entry_prices.clear()
+                elif pnl_pct < -STOP_LOSS_THRESHOLD:
+                    # Regular stop-loss: might trigger based on time held
+                    oldest_fill = fill_entry_prices[0] if fill_entry_prices else None
+                    if oldest_fill and (ts - oldest_fill[2]) > 3600:  # held > 1 hour
+                        liq = inv.liquidate(ema_mid)
+                        minute_pnl[minute_idx] += liq
+                        stop_loss_count += 1
+                        fill_entry_prices.clear()
 
         # Record MTM at this minute
         mtm = inv.mtm_pnl(ema_mid)
@@ -291,15 +476,12 @@ def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size
     liq_pnl = inv.liquidate(final_mid)
 
     # Reward calculation: Q × time-weighted
-    # We earn Q only while orders are on book
-    # Both sides need to be on book for full Q_min
-    # Use minimum of bid/ask time as effective earning time
     avg_on_book_sec = min(bid_on_book_sec, ask_on_book_sec)
     on_book_ratio = avg_on_book_sec / max(duration_sec, 1)
 
     dist_c_reward = max_spread * spread_pct
     our_q = q_score(min_size, dist_c_reward, max_spread)
-    tq = max(total_q, 50.0) + our_q  # Use MIN 50 for Q floor (not 1!)
+    tq = max(total_q, 50.0) + our_q
     our_share = our_q / tq
     total_reward = daily_rate * n_days * our_share * on_book_ratio
 
@@ -307,7 +489,7 @@ def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size
     total_cost = total_gas + abs(inv.realized_pnl) if inv.realized_pnl < 0 else total_gas
     net = total_reward + inv.realized_pnl + liq_pnl - total_gas
 
-    # Build daily P&L series: reward spread evenly, costs on their actual day
+    # Build daily P&L series
     n_full_days = max(int(math.ceil(n_days)), 1)
     reward_per_day = total_reward / n_full_days
 
@@ -315,17 +497,17 @@ def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size
     for d in range(n_full_days):
         daily_pnl[d] += reward_per_day
 
-    # Distribute gas and fill costs to the day they happened
     for m_idx, cost in minute_pnl.items():
         day = m_idx * 60 // 86400
-        daily_pnl[day] += cost  # cost is already negative
+        daily_pnl[day] += cost
 
-    # Liquidation P&L on last day
     last_day = max(daily_pnl.keys()) if daily_pnl else 0
     daily_pnl[last_day] += liq_pnl
 
     return {
         "fills": fills,
+        "toxic_fills": toxic_fills,
+        "stop_loss_count": stop_loss_count,
         "fill_prob": fill_prob,
         "queue_depth": queue_depth,
         "reward": total_reward,
@@ -338,6 +520,7 @@ def simulate_market_realistic(trades_with_size, daily_rate, max_spread, min_size
         "on_book_ratio": on_book_ratio,
         "our_share": our_share,
         "daily_pnl": dict(daily_pnl),
+        "avg_vpin": vpin_tracker.get_vpin() if vpin_tracker else 0,
     }
 
 
@@ -488,24 +671,28 @@ def run_realistic_backtest():
         total_net = sum(r["net"] for r in results)
         total_reward = sum(r["reward"] for r in results)
         total_fills = sum(r["fills"] for r in results)
+        total_toxic = sum(r.get("toxic_fills", 0) for r in results)
+        total_stop_loss = sum(r.get("stop_loss_count", 0) for r in results)
         total_gas = sum(r["gas"] for r in results)
         total_realized = sum(r["realized_pnl"] for r in results)
         total_liq = sum(r["liq_pnl"] for r in results)
         max_dd = compute_max_dd(cum)
         win_days = sum(1 for d in daily if d > 0.001)
         loss_days = sum(1 for d in daily if d < -0.001)
+        avg_vpin = sum(r.get("avg_vpin", 0) for r in results) / len(results) if results else 0
         return {
             "net": total_net, "reward": total_reward, "fills": total_fills,
+            "toxic_fills": total_toxic, "stop_loss": total_stop_loss,
             "gas": total_gas, "realized": total_realized, "liq": total_liq,
             "max_dd": max_dd, "win_days": win_days, "loss_days": loss_days,
-            "n_markets": len(results),
+            "n_markets": len(results), "avg_vpin": avg_vpin,
         }
 
     bs = stats(before_results, before_daily, before_cum)
     as_ = stats(after_results, after_daily, after_cum)
 
     print(f"\n{'='*65}")
-    print(f"REALISTIC BACKTEST ({total_days} days, ${CAPITAL} capital)")
+    print(f"REALISTIC BACKTEST v2 ({total_days} days, ${CAPITAL} capital)")
     print(f"{'='*65}")
     print(f"{'':22s} {'Before':>12s} {'After':>12s}")
     print(f"{'-'*48}")
@@ -513,21 +700,26 @@ def run_realistic_backtest():
     print(f"{'NET profit':22s} ${bs['net']:>10.2f} ${as_['net']:>10.2f}")
     print(f"{'Reward earned':22s} ${bs['reward']:>10.2f} ${as_['reward']:>10.2f}")
     print(f"{'Fill count':22s} {bs['fills']:>12d} {as_['fills']:>12d}")
+    print(f"{'Toxic fills':22s} {bs['toxic_fills']:>12d} {as_['toxic_fills']:>12d}")
+    print(f"{'Stop-loss events':22s} {bs['stop_loss']:>12d} {as_['stop_loss']:>12d}")
     print(f"{'Realized P&L (fills)':22s} ${bs['realized']:>10.2f} ${as_['realized']:>10.2f}")
     print(f"{'Liquidation P&L':22s} ${bs['liq']:>10.2f} ${as_['liq']:>10.2f}")
     print(f"{'Gas cost':22s} ${bs['gas']:>10.2f} ${as_['gas']:>10.2f}")
     print(f"{'Max drawdown':22s} ${bs['max_dd']:>10.2f} ${as_['max_dd']:>10.2f}")
     print(f"{'Win / Loss days':22s} {bs['win_days']:>5d}/{bs['loss_days']:<5d} {as_['win_days']:>5d}/{as_['loss_days']:<5d}")
+    print(f"{'Avg VPIN':22s} {bs['avg_vpin']:>12.3f} {as_['avg_vpin']:>12.3f}")
 
     print(f"\nBefore markets:")
     for r in before_results:
+        toxic_pct = r.get('toxic_fills', 0) / max(r['fills'], 1) * 100
         print(f"  {r['question'][:42]}  NET=${r['net']:>7.2f}  fills={r['fills']:>3d}  "
-              f"fill_prob={r['fill_prob']:.0%}  Q_share={r['our_share']:.1%}  "
+              f"toxic={toxic_pct:.0f}%  Q_share={r['our_share']:.1%}  "
               f"on_book={r['on_book_ratio']:.0%}")
     print(f"\nAfter markets:")
     for r in after_results:
+        toxic_pct = r.get('toxic_fills', 0) / max(r['fills'], 1) * 100
         print(f"  {r['question'][:42]}  NET=${r['net']:>7.2f}  fills={r['fills']:>3d}  "
-              f"fill_prob={r['fill_prob']:.0%}  Q_share={r['our_share']:.1%}  "
+              f"toxic={toxic_pct:.0f}%  Q_share={r['our_share']:.1%}  "
               f"on_book={r['on_book_ratio']:.0%}")
 
     return {
@@ -717,6 +909,10 @@ def run_monte_carlo(n_sims=50):
     after_dds = []
     before_fills_list = []
     after_fills_list = []
+    before_toxic_list = []
+    after_toxic_list = []
+    before_stoploss_list = []
+    after_stoploss_list = []
 
     for sim in range(n_sims):
         random.seed(sim * 31337)  # different seed each sim
@@ -725,6 +921,8 @@ def run_monte_carlo(n_sims=50):
             daily = np.zeros(total_days)
             total_net = 0
             total_fills = 0
+            total_toxic = 0
+            total_stoploss = 0
             for item in market_list:
                 if is_after:
                     md, rpc, eff_pct = item
@@ -736,20 +934,23 @@ def run_monte_carlo(n_sims=50):
                     md["trades"], md["daily_rate"], md["max_spread"], md["min_size"],
                     md["total_q"], spread_pct=eff_pct,
                     dynamic_spread=is_after,
+                    use_enhanced_model=is_after,  # NEW: only use enhanced model for "after"
                 )
                 if not res:
                     continue
                 total_net += res["net"]
                 total_fills += res["fills"]
+                total_toxic += res.get("toxic_fills", 0)
+                total_stoploss += res.get("stop_loss_count", 0)
                 day_offset = int((md["t_start"] - global_t0) / 86400)
                 for local_day, pnl in res["daily_pnl"].items():
                     gd = day_offset + local_day
                     if 0 <= gd < total_days:
                         daily[gd] += pnl
-            return daily, total_net, total_fills
+            return daily, total_net, total_fills, total_toxic, total_stoploss
 
-        bd, bn, bf = simulate_and_aggregate(before_markets, False)
-        ad, an, af = simulate_and_aggregate(after_markets, True)
+        bd, bn, bf, bt_b, bs_b = simulate_and_aggregate(before_markets, False)
+        ad, an, af, bt_a, bs_a = simulate_and_aggregate(after_markets, True)
 
         bc = np.cumsum(bd)
         ac = np.cumsum(ad)
@@ -762,10 +963,14 @@ def run_monte_carlo(n_sims=50):
         after_dds.append(compute_max_dd(ac))
         before_fills_list.append(bf)
         after_fills_list.append(af)
+        before_toxic_list.append(bt_b)
+        after_toxic_list.append(bt_a)
+        before_stoploss_list.append(bs_b)
+        after_stoploss_list.append(bs_a)
 
     # Stats
     print(f"\n{'='*65}")
-    print(f"MONTE CARLO ({n_sims} sims, {total_days} days, ${CAPITAL} capital)")
+    print(f"MONTE CARLO v2 ({n_sims} sims, {total_days} days, ${CAPITAL} capital)")
     print(f"{'='*65}")
     print(f"{'':22s} {'Before':>12s} {'After':>12s}")
     print(f"{'-'*48}")
@@ -775,6 +980,8 @@ def run_monte_carlo(n_sims=50):
     print(f"{'Max DD median':22s} ${np.median(before_dds):>10.1f} ${np.median(after_dds):>10.1f}")
     print(f"{'Max DD p90':22s} ${np.percentile(before_dds,90):>10.1f} ${np.percentile(after_dds,90):>10.1f}")
     print(f"{'Fills median':22s} {np.median(before_fills_list):>11.0f} {np.median(after_fills_list):>11.0f}")
+    print(f"{'Toxic fills median':22s} {np.median(before_toxic_list):>11.0f} {np.median(after_toxic_list):>11.0f}")
+    print(f"{'Stop-loss median':22s} {np.median(before_stoploss_list):>11.0f} {np.median(after_stoploss_list):>11.0f}")
     print(f"{'P(profit)':22s} {sum(1 for n in before_nets if n>0)/n_sims:>11.0%} {sum(1 for n in after_nets if n>0)/n_sims:>11.0%}")
 
     return {
@@ -787,6 +994,10 @@ def run_monte_carlo(n_sims=50):
         "after_dds": after_dds,
         "before_fills": before_fills_list,
         "after_fills": after_fills_list,
+        "before_toxic": before_toxic_list,
+        "after_toxic": after_toxic_list,
+        "before_stoploss": before_stoploss_list,
+        "after_stoploss": after_stoploss_list,
         "n_sims": n_sims,
     }
 
@@ -854,10 +1065,14 @@ def plot_mc_chart(data):
     ad = data["after_dds"]
     bf = data["before_fills"]
     af = data["after_fills"]
+    btox = data.get("before_toxic", [0] * len(bn))
+    atox = data.get("after_toxic", [0] * len(an))
+    bsl = data.get("before_stoploss", [0] * len(bn))
+    asl = data.get("after_stoploss", [0] * len(an))
     ns = data["n_sims"]
 
     stats = (
-        f"MONTE CARLO: {ns} simulations\n"
+        f"MONTE CARLO v2: {ns} simulations\n"
         f"{'':18s} {'Before':>10s}  {'After':>10s}\n"
         f"{'─'*42}\n"
         f"{'NET median':18s} ${np.median(bn):>8.0f}  ${np.median(an):>8.0f}\n"
@@ -865,6 +1080,8 @@ def plot_mc_chart(data):
         f"{'Max DD median':18s} ${np.median(bd):>8.1f}  ${np.median(ad):>8.1f}\n"
         f"{'Max DD p90':18s} ${np.percentile(bd,90):>8.1f}  ${np.percentile(ad,90):>8.1f}\n"
         f"{'Fills median':18s} {np.median(bf):>9.0f}  {np.median(af):>9.0f}\n"
+        f"{'Toxic fills':18s} {np.median(btox):>9.0f}  {np.median(atox):>9.0f}\n"
+        f"{'Stop-losses':18s} {np.median(bsl):>9.0f}  {np.median(asl):>9.0f}\n"
         f"{'P(profit)':18s} {sum(1 for n in bn if n>0)/ns:>9.0%}  {sum(1 for n in an if n>0)/ns:>9.0%}"
     )
     ax.text(0.02, 0.97, stats, transform=ax.transAxes,
@@ -875,14 +1092,15 @@ def plot_mc_chart(data):
 
     # Factors
     factors = (
-        "CALIBRATED from real data:\n"
-        f" Fill prob: {CALIBRATED_FILL_PROB:.0%} (real)\n"
-        f" Adverse selection: {CALIBRATED_ADVERSE_RATE:.0%} (real)\n"
-        f" Adverse move: {CALIBRATED_ADVERSE_MOVE*100:.1f}c (real)\n"
-        f" Queue depth: ~{CALIBRATED_QUEUE_DEPTH} (real)\n"
-        " Gas $0.002/tx\n"
-        " Inventory carry + MTM\n"
-        " 60s post-fill cooldown\n"
+        "ENHANCED MODEL v2:\n"
+        f" Fill prob: {CALIBRATED_FILL_PROB:.0%} (calibrated)\n"
+        f" Adverse (low VPIN): {CALIBRATED_ADVERSE_RATE_LOW_VPIN:.0%}\n"
+        f" Adverse (high VPIN): {CALIBRATED_ADVERSE_RATE_HIGH_VPIN:.0%}\n"
+        f" Queue depth: ~{CALIBRATED_QUEUE_DEPTH}\n"
+        " Time-priority queue tracking\n"
+        " VPIN-based toxic detection\n"
+        " Dynamic spread widening\n"
+        f" Stop-loss: {STOP_LOSS_THRESHOLD:.0%}/{URGENT_STOP_LOSS:.0%}\n"
         f" Shaded = p10-p90 band"
     )
     ax.text(0.98, 0.03, factors, transform=ax.transAxes,

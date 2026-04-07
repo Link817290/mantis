@@ -31,7 +31,9 @@ DATA_API_BASE = "https://data-api.polymarket.com"
 
 logger = logging.getLogger("mantis.paper")
 
-DB_PATH = Path("/workspace/mantis/data/paper_trades.db")
+# Cross-platform path: use the directory where this module is located
+_MODULE_DIR = Path(__file__).parent.parent.resolve()
+DB_PATH = _MODULE_DIR / "data" / "paper_trades.db"
 
 
 # ── Data types ──
@@ -53,6 +55,107 @@ class VirtualOrder:
     mid_at_fill: float = 0.0
     mid_after_60s: float = 0.0   # price 60s after fill (adverse selection check)
     queue_depth_at_place: float = 0.0  # estimated queue ahead of us
+    # === 新增: 时间优先队列追踪 ===
+    queue_position: float = 0.0       # 我们在队列中的位置(前面有多少量)
+    volume_filled_at_level: float = 0.0  # 该价位已成交的总量(用于追踪队列推进)
+    join_sequence: int = 0            # 加入队列的顺序号
+
+
+@dataclass
+class InformedTraderStats:
+    """Tracks patterns that indicate informed/toxic order flow."""
+    recent_trades: list = field(default_factory=list)  # (ts, price, size, side)
+    vpin_buckets: list = field(default_factory=list)   # (buy_vol, sell_vol) per bucket
+    bucket_volume: float = 0.0
+    current_bucket_buy: float = 0.0
+    current_bucket_sell: float = 0.0
+
+    def add_trade(self, ts: float, price: float, size: float, side: str, mid: float):
+        """添加一笔交易并更新统计"""
+        self.recent_trades.append((ts, price, size, side, mid))
+        # 保留最近200笔
+        if len(self.recent_trades) > 200:
+            self.recent_trades = self.recent_trades[-200:]
+
+        # VPIN bucket (每30单位量一个bucket)
+        if side == "BUY":
+            self.current_bucket_buy += size
+        else:
+            self.current_bucket_sell += size
+        self.bucket_volume += size
+
+        if self.bucket_volume >= 30:
+            self.vpin_buckets.append((self.current_bucket_buy, self.current_bucket_sell))
+            if len(self.vpin_buckets) > 30:
+                self.vpin_buckets = self.vpin_buckets[-30:]
+            self.bucket_volume = 0
+            self.current_bucket_buy = 0
+            self.current_bucket_sell = 0
+
+    def get_vpin(self) -> float:
+        """计算当前VPIN值 (0-1, 越高越toxic)"""
+        if len(self.vpin_buckets) < 5:
+            return 0.0
+        total_imbalance = sum(abs(b - s) for b, s in self.vpin_buckets)
+        total_volume = sum(b + s for b, s in self.vpin_buckets)
+        return total_imbalance / total_volume if total_volume > 0 else 0.0
+
+    def get_momentum(self, window_sec: float = 30) -> tuple[float, str]:
+        """检测价格动量 (短期单边移动)"""
+        if len(self.recent_trades) < 3:
+            return 0.0, "neutral"
+
+        now = self.recent_trades[-1][0]
+        cutoff = now - window_sec
+        recent = [(t[0], t[4]) for t in self.recent_trades if t[0] > cutoff]  # (ts, mid)
+
+        if len(recent) < 2:
+            return 0.0, "neutral"
+
+        start_mid = recent[0][1]
+        end_mid = recent[-1][1]
+        move = end_mid - start_mid
+
+        direction = "up" if move > 0 else "down" if move < 0 else "neutral"
+        return abs(move), direction
+
+    def get_trade_imbalance(self, window_sec: float = 60) -> float:
+        """计算最近交易的买卖不平衡 (-1 到 1, 正为买方主导)"""
+        if not self.recent_trades:
+            return 0.0
+
+        now = self.recent_trades[-1][0]
+        cutoff = now - window_sec
+        recent = [t for t in self.recent_trades if t[0] > cutoff]
+
+        buy_vol = sum(t[2] for t in recent if t[3] == "BUY")
+        sell_vol = sum(t[2] for t in recent if t[3] == "SELL")
+        total = buy_vol + sell_vol
+
+        if total == 0:
+            return 0.0
+        return (buy_vol - sell_vol) / total
+
+    def is_toxic_flow(self, side: str) -> tuple[bool, str]:
+        """判断当前订单流是否对我方有毒"""
+        vpin = self.get_vpin()
+        momentum, direction = self.get_momentum()
+        imbalance = self.get_trade_imbalance()
+
+        # 对于BUY订单，卖方主导的toxic flow是危险的(价格可能下跌)
+        # 对于SELL订单，买方主导的toxic flow是危险的(价格可能上涨)
+        if side == "BUY":
+            if vpin > 0.35 and imbalance < -0.3:
+                return True, f"VPIN={vpin:.2f}, sell_dominant={imbalance:.2f}"
+            if direction == "down" and momentum > 0.02:
+                return True, f"momentum_down={momentum:.3f}"
+        else:  # SELL
+            if vpin > 0.35 and imbalance > 0.3:
+                return True, f"VPIN={vpin:.2f}, buy_dominant={imbalance:.2f}"
+            if direction == "up" and momentum > 0.02:
+                return True, f"momentum_up={momentum:.3f}"
+
+        return False, ""
 
 
 @dataclass
@@ -81,6 +184,15 @@ class MarketTracker:
     ask_cooldown_until: float = 0.0
     last_ob_mid: float = 0.0
     price_history: list[tuple[float, float]] = field(default_factory=list)  # (ts, mid)
+    # === 新增: 高级追踪 ===
+    informed_stats: InformedTraderStats = field(default_factory=InformedTraderStats)
+    order_sequence: int = 0  # 订单序列号
+    # 队列追踪: {price_level: cumulative_volume_filled}
+    bid_level_fills: dict = field(default_factory=dict)
+    ask_level_fills: dict = field(default_factory=dict)
+    # 回测校准数据
+    fills_by_time_in_queue: list = field(default_factory=list)  # (queue_time_sec, was_filled)
+    toxic_fill_count: int = 0  # 被toxic flow吃的fill数量
 
 
 # ── Database ──
@@ -103,7 +215,13 @@ def init_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
             fill_price REAL,
             mid_at_fill REAL,
             mid_after_60s REAL,
-            queue_depth REAL
+            queue_depth REAL,
+            -- 新增: 队列位置追踪
+            queue_position REAL DEFAULT 0,
+            queue_time_sec REAL DEFAULT 0,
+            is_toxic INTEGER DEFAULT 0,
+            vpin_at_fill REAL DEFAULT 0,
+            imbalance_at_fill REAL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS paper_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,7 +232,11 @@ def init_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
             bid_depth_5 REAL,
             ask_depth_5 REAL,
             total_q REAL,
-            n_trades_since_last INTEGER
+            n_trades_since_last INTEGER,
+            -- 新增: 竞争和流动性指标
+            vpin REAL DEFAULT 0,
+            trade_imbalance REAL DEFAULT 0,
+            q_competition REAL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS paper_trades_seen (
             trade_id TEXT PRIMARY KEY,
@@ -122,11 +244,60 @@ def init_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
             ts REAL,
             price REAL,
             size REAL,
-            side TEXT
+            side TEXT,
+            mid_at_trade REAL DEFAULT 0
+        );
+        -- 新增: 队列时间分布追踪
+        CREATE TABLE IF NOT EXISTS queue_time_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            condition_id TEXT,
+            queue_time_sec REAL,
+            was_filled INTEGER,
+            recorded_at REAL
         );
         CREATE INDEX IF NOT EXISTS idx_po_cid ON paper_orders(condition_id);
         CREATE INDEX IF NOT EXISTS idx_ps_cid ON paper_snapshots(condition_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_qts_cid ON queue_time_stats(condition_id);
     """)
+
+    # 添加新列到现有表(如果不存在)
+    try:
+        conn.execute("ALTER TABLE paper_orders ADD COLUMN queue_position REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE paper_orders ADD COLUMN queue_time_sec REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE paper_orders ADD COLUMN is_toxic INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE paper_orders ADD COLUMN vpin_at_fill REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE paper_orders ADD COLUMN imbalance_at_fill REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE paper_snapshots ADD COLUMN vpin REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE paper_snapshots ADD COLUMN trade_imbalance REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE paper_snapshots ADD COLUMN q_competition REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE paper_trades_seen ADD COLUMN mid_at_trade REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     return conn
 
@@ -192,19 +363,25 @@ class PaperTrader:
 
         # 2. Fetch recent trades via public Data API
         trades = self._fetch_public_trades(tracker.condition_id)
-        new_trades = self._filter_new_trades(tracker, trades)
+        new_trades = self._filter_new_trades(tracker, trades, mid)
         tracker.total_trades_seen += len(new_trades)
 
         # Check if any of our virtual orders would have been filled
         self._check_fills(tracker, new_trades, mid, now)
 
-        # Record snapshot with trade count
+        # 获取informed trader统计
+        vpin = tracker.informed_stats.get_vpin()
+        imbalance = tracker.informed_stats.get_trade_imbalance()
+
+        # Record snapshot with extended data
         self.conn.execute(
             "INSERT INTO paper_snapshots (ts, condition_id, mid, spread_cents, "
-            "bid_depth_5, ask_depth_5, total_q, n_trades_since_last) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "bid_depth_5, ask_depth_5, total_q, n_trades_since_last, "
+            "vpin, trade_imbalance, q_competition) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (now, tracker.condition_id, mid, ob.spread_cents,
-             bid_depth_5, ask_depth_5, total_q, len(new_trades)),
+             bid_depth_5, ask_depth_5, total_q, len(new_trades),
+             vpin, imbalance, total_q),
         )
 
         # 3. Place or refresh virtual orders
@@ -238,7 +415,8 @@ class PaperTrader:
             logger.debug(f"Failed to fetch trades: {e}")
             return []
 
-    def _filter_new_trades(self, tracker: MarketTracker, trades: list[dict]) -> list[dict]:
+    def _filter_new_trades(self, tracker: MarketTracker, trades: list[dict],
+                           current_mid: float = 0) -> list[dict]:
         """Filter trades we haven't seen yet."""
         new = []
         seen_ids = set()
@@ -257,13 +435,14 @@ class PaperTrader:
             if not tid or tid in seen_ids:
                 continue
             new.append(t)
-            # Record this trade
+            # Record this trade with mid price
             self.conn.execute(
                 "INSERT OR IGNORE INTO paper_trades_seen "
-                "(trade_id, condition_id, ts, price, size, side) VALUES (?, ?, ?, ?, ?, ?)",
+                "(trade_id, condition_id, ts, price, size, side, mid_at_trade) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (tid, tracker.condition_id, time.time(),
                  float(t.get("price", 0)), float(t.get("size", 0)),
-                 t.get("side", "")),
+                 t.get("side", ""), current_mid),
             )
         return new
 
@@ -271,12 +450,14 @@ class PaperTrader:
                      current_mid: float, now: float):
         """Check if new trades would have filled our virtual orders.
 
+        改进的Fill逻辑 (Time Priority + Pro-rata混合模型):
+        1. Time Priority: 追踪我们在队列中的位置，前面的订单需要先被fill
+        2. Pro-rata: 当同一tick有多笔trade时，按比例分配
+        3. Toxic Flow Detection: 检测是否被informed trader吃单
+
         Fill logic: A trade crosses our virtual order if:
         - For our BUY order: a SELL trade at price <= our bid price
         - For our ASK order: a BUY trade at price >= our ask price
-
-        Pro-rata fill probability: our_size / (our_size + queue_depth_ahead)
-        We use the actual queue depth from the orderbook at placement time.
         """
         import random
 
@@ -284,29 +465,110 @@ class PaperTrader:
             t_price = float(trade.get("price", 0))
             t_size = float(trade.get("size", 0))
             t_side = trade.get("side", "").upper()
+            t_ts = trade.get("timestamp", now)
+
+            # 更新informed trader统计
+            tracker.informed_stats.add_trade(t_ts, t_price, t_size, t_side, current_mid)
 
             # Check bid fill: someone sold at or below our bid
             if tracker.bid_order and tracker.bid_order.status == "live":
                 order = tracker.bid_order
                 if t_side == "SELL" and t_price <= order.price:
-                    # Pro-rata: probability of us getting filled
-                    queue = order.queue_depth_at_place
-                    fill_prob = order.size / (order.size + queue) if queue > 0 else 1.0
-                    if random.random() < fill_prob:
-                        self._record_fill(tracker, order, t_price, current_mid, now)
+                    # 更新该价位的累计成交量
+                    price_key = round(order.price, 4)
+                    prev_fill_vol = tracker.bid_level_fills.get(price_key, 0)
+                    tracker.bid_level_fills[price_key] = prev_fill_vol + t_size
+
+                    # Time Priority 模型: 我们需要等前面的队列被消耗
+                    # queue_position 是我们前面的量，需要先被fill
+                    volume_filled_since_join = tracker.bid_level_fills[price_key] - order.volume_filled_at_level
+
+                    if volume_filled_since_join >= order.queue_position:
+                        # 前面的队列已经被消耗，现在检查我们是否被fill
+                        remaining_volume = volume_filled_since_join - order.queue_position
+                        fill_prob = self._compute_fill_probability(
+                            order, remaining_volume, t_size, tracker, "BUY"
+                        )
+                        if random.random() < fill_prob:
+                            # 检测是否是toxic fill
+                            is_toxic, toxic_reason = tracker.informed_stats.is_toxic_flow("BUY")
+                            if is_toxic:
+                                tracker.toxic_fill_count += 1
+                                logger.debug(f"Toxic fill detected: {toxic_reason}")
+
+                            queue_time = now - order.placed_at
+                            tracker.fills_by_time_in_queue.append((queue_time, True))
+                            self._record_fill(tracker, order, t_price, current_mid, now,
+                                              is_toxic=is_toxic, toxic_reason=toxic_reason)
+                    else:
+                        # 记录队列推进但未fill
+                        order.volume_filled_at_level = tracker.bid_level_fills[price_key]
 
             # Check ask fill: someone bought at or above our ask
             if tracker.ask_order and tracker.ask_order.status == "live":
                 order = tracker.ask_order
                 if t_side == "BUY" and t_price >= order.price:
-                    queue = order.queue_depth_at_place
-                    fill_prob = order.size / (order.size + queue) if queue > 0 else 1.0
-                    if random.random() < fill_prob:
-                        self._record_fill(tracker, order, t_price, current_mid, now)
+                    price_key = round(order.price, 4)
+                    prev_fill_vol = tracker.ask_level_fills.get(price_key, 0)
+                    tracker.ask_level_fills[price_key] = prev_fill_vol + t_size
+
+                    volume_filled_since_join = tracker.ask_level_fills[price_key] - order.volume_filled_at_level
+
+                    if volume_filled_since_join >= order.queue_position:
+                        remaining_volume = volume_filled_since_join - order.queue_position
+                        fill_prob = self._compute_fill_probability(
+                            order, remaining_volume, t_size, tracker, "SELL"
+                        )
+                        if random.random() < fill_prob:
+                            is_toxic, toxic_reason = tracker.informed_stats.is_toxic_flow("SELL")
+                            if is_toxic:
+                                tracker.toxic_fill_count += 1
+
+                            queue_time = now - order.placed_at
+                            tracker.fills_by_time_in_queue.append((queue_time, True))
+                            self._record_fill(tracker, order, t_price, current_mid, now,
+                                              is_toxic=is_toxic, toxic_reason=toxic_reason)
+                    else:
+                        order.volume_filled_at_level = tracker.ask_level_fills[price_key]
+
+    def _compute_fill_probability(self, order: VirtualOrder, remaining_volume: float,
+                                   trade_size: float, tracker: MarketTracker,
+                                   side: str) -> float:
+        """计算fill概率 (混合Time Priority + Pro-rata).
+
+        Polymarket使用Pro-rata模型，但在实际中:
+        1. 较早的订单有轻微优势
+        2. 较大的taker订单可能partial fill我们
+        3. 如果taker订单远大于队列，fill概率接近1
+        """
+        our_size = order.size
+        queue_remaining = max(0, order.queue_position - remaining_volume + our_size)
+
+        if queue_remaining <= 0:
+            return 1.0
+
+        # 基础 Pro-rata 概率
+        base_prob = our_size / queue_remaining if queue_remaining > 0 else 1.0
+
+        # 调整因子1: taker订单大小
+        # 如果taker订单很大，我们更可能被fill
+        size_multiplier = min(2.0, trade_size / (our_size + 10))
+
+        # 调整因子2: 时间在队列中
+        # 在Polymarket没有时间优先，但市场maker可能有re-quote行为
+        # 导致长时间在队列中的订单更可能被fill
+        time_in_queue = time.time() - order.placed_at
+        time_bonus = min(0.2, time_in_queue / 600)  # 最多+20%，10分钟达到
+
+        # 最终概率
+        prob = min(1.0, base_prob * (1 + size_multiplier * 0.3) + time_bonus)
+
+        return prob
 
     def _record_fill(self, tracker: MarketTracker, order: VirtualOrder,
-                     fill_price: float, current_mid: float, now: float):
-        """Record a virtual fill."""
+                     fill_price: float, current_mid: float, now: float,
+                     is_toxic: bool = False, toxic_reason: str = ""):
+        """Record a virtual fill with toxic flow detection."""
         order.status = "filled"
         order.filled_at = now
         order.fill_price = fill_price
@@ -333,21 +595,29 @@ class PaperTrader:
         # Schedule adverse selection check (60s later)
         self._pending_fill_checks.append((now + 60, order.order_id, current_mid))
 
-        # Save to DB
+        # 计算额外的统计信息
+        queue_time = now - order.placed_at
+        vpin = tracker.informed_stats.get_vpin()
+        imbalance = tracker.informed_stats.get_trade_imbalance()
+
+        # Save to DB (extended schema)
         self.conn.execute(
             "INSERT OR REPLACE INTO paper_orders "
             "(order_id, condition_id, token_id, side, price, size, placed_at, "
-            "mid_at_place, status, filled_at, fill_price, mid_at_fill, mid_after_60s, queue_depth) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "mid_at_place, status, filled_at, fill_price, mid_at_fill, mid_after_60s, queue_depth, "
+            "queue_position, queue_time_sec, is_toxic, vpin_at_fill, imbalance_at_fill) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (order.order_id, tracker.condition_id, order.token_id,
              order.side, order.price, order.size, order.placed_at,
              order.mid_at_place, "filled", order.filled_at, fill_price,
-             current_mid, 0.0, order.queue_depth_at_place),
+             current_mid, 0.0, order.queue_depth_at_place,
+             order.queue_position, queue_time, int(is_toxic), vpin, imbalance),
         )
 
+        toxic_flag = " [TOXIC]" if is_toxic else ""
         logger.info(
             f"FILL: {order.side} {order.size}@{fill_price:.4f} "
-            f"mid={current_mid:.4f} | {tracker.question[:30]}"
+            f"mid={current_mid:.4f} queue={queue_time:.0f}s{toxic_flag} | {tracker.question[:30]}"
         )
 
     def _check_deferred_measurements(self, now: float):
@@ -394,33 +664,51 @@ class PaperTrader:
 
         min_size = tracker.min_size
 
-        # Estimate queue depth at our price level
+        # Estimate queue depth at our price level (真正的队列位置)
         bid_queue = self._estimate_queue_depth(ob.bids, bid_price, "bid")
         ask_queue = self._estimate_queue_depth(ob.asks, ask_price, "ask")
+
+        # 计算Q竞争 (同一价位的Q score竞争)
+        q_competition = self._estimate_q_competition(ob, bid_price, ask_price, tracker.max_spread)
 
         # Refresh bid
         if tracker.bid_order and tracker.bid_order.status == "live":
             # Reprice if mid moved significantly
             if abs(bid_price - tracker.bid_order.price) > self.config.engine.reprice_threshold:
+                # 记录cancelled order的队列时间
+                queue_time = now - tracker.bid_order.placed_at
+                tracker.fills_by_time_in_queue.append((queue_time, False))
                 tracker.bid_order.status = "cancelled"
                 tracker.bid_order = None
             # Expire orders older than 5 minutes
             elif now - tracker.bid_order.placed_at > 300:
+                queue_time = now - tracker.bid_order.placed_at
+                tracker.fills_by_time_in_queue.append((queue_time, False))
                 tracker.bid_order.status = "cancelled"
                 tracker.bid_order = None
 
         if tracker.ask_order and tracker.ask_order.status == "live":
             if abs(ask_price - tracker.ask_order.price) > self.config.engine.reprice_threshold:
+                queue_time = now - tracker.ask_order.placed_at
+                tracker.fills_by_time_in_queue.append((queue_time, False))
                 tracker.ask_order.status = "cancelled"
                 tracker.ask_order = None
             elif now - tracker.ask_order.placed_at > 300:
+                queue_time = now - tracker.ask_order.placed_at
+                tracker.fills_by_time_in_queue.append((queue_time, False))
                 tracker.ask_order.status = "cancelled"
                 tracker.ask_order = None
 
         # Place new bid if needed
         if tracker.bid_order is None and now >= tracker.bid_cooldown_until:
             self._order_counter += 1
+            tracker.order_sequence += 1
             oid = f"paper-bid-{self._order_counter}"
+
+            # 获取当前价位的累计成交量(用于追踪队列推进)
+            price_key = round(bid_price, 4)
+            current_level_fills = tracker.bid_level_fills.get(price_key, 0)
+
             tracker.bid_order = VirtualOrder(
                 order_id=oid,
                 condition_id=tracker.condition_id,
@@ -431,20 +719,29 @@ class PaperTrader:
                 placed_at=now,
                 mid_at_place=mid,
                 queue_depth_at_place=bid_queue,
+                queue_position=bid_queue,  # 我们排在当前队列后面
+                volume_filled_at_level=current_level_fills,
+                join_sequence=tracker.order_sequence,
             )
             self.conn.execute(
                 "INSERT OR REPLACE INTO paper_orders "
                 "(order_id, condition_id, token_id, side, price, size, placed_at, "
-                "mid_at_place, status, filled_at, fill_price, mid_at_fill, mid_after_60s, queue_depth) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "mid_at_place, status, filled_at, fill_price, mid_at_fill, mid_after_60s, "
+                "queue_depth, queue_position) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (oid, tracker.condition_id, tracker.token_id,
-                 "BUY", bid_price, min_size, now, mid, "live", 0, 0, 0, 0, bid_queue),
+                 "BUY", bid_price, min_size, now, mid, "live", 0, 0, 0, 0, bid_queue, bid_queue),
             )
 
         # Place new ask if needed
         if tracker.ask_order is None and now >= tracker.ask_cooldown_until:
             self._order_counter += 1
+            tracker.order_sequence += 1
             oid = f"paper-ask-{self._order_counter}"
+
+            price_key = round(ask_price, 4)
+            current_level_fills = tracker.ask_level_fills.get(price_key, 0)
+
             tracker.ask_order = VirtualOrder(
                 order_id=oid,
                 condition_id=tracker.condition_id,
@@ -455,15 +752,30 @@ class PaperTrader:
                 placed_at=now,
                 mid_at_place=mid,
                 queue_depth_at_place=ask_queue,
+                queue_position=ask_queue,
+                volume_filled_at_level=current_level_fills,
+                join_sequence=tracker.order_sequence,
             )
             self.conn.execute(
                 "INSERT OR REPLACE INTO paper_orders "
                 "(order_id, condition_id, token_id, side, price, size, placed_at, "
-                "mid_at_place, status, filled_at, fill_price, mid_at_fill, mid_after_60s, queue_depth) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "mid_at_place, status, filled_at, fill_price, mid_at_fill, mid_after_60s, "
+                "queue_depth, queue_position) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (oid, tracker.condition_id, tracker.token_id,
-                 "SELL", ask_price, min_size, now, mid, "live", 0, 0, 0, 0, ask_queue),
+                 "SELL", ask_price, min_size, now, mid, "live", 0, 0, 0, 0, ask_queue, ask_queue),
             )
+
+    def _estimate_q_competition(self, ob, bid_price: float, ask_price: float,
+                                 max_spread: float) -> float:
+        """估算Q score竞争程度.
+
+        计算在我们报价价位附近的其他maker的Q贡献。
+        Q竞争越高，我们获得的奖励占比越低。
+        """
+        from .scanner import compute_total_q_min
+        total_q = compute_total_q_min(ob, max_spread)
+        return total_q
 
     def _estimate_queue_depth(self, levels: list, our_price: float, side: str) -> float:
         """Estimate how much size is queued ahead of us at our price level.
@@ -500,7 +812,7 @@ def get_stats(db_path: Path = DB_PATH) -> str:
     ).fetchone()[0]
 
     lines.append("=" * 60)
-    lines.append("PAPER TRADING STATISTICS")
+    lines.append("PAPER TRADING STATISTICS (Enhanced)")
     lines.append("=" * 60)
     lines.append(f"Total orders placed:  {total_orders}")
     lines.append(f"Filled:               {filled_orders}")
@@ -522,6 +834,76 @@ def get_stats(db_path: Path = DB_PATH) -> str:
 
     lines.append("")
 
+    # === 新增: Queue Time Analysis ===
+    lines.append("--- Queue Time Analysis ---")
+    rows = conn.execute(
+        "SELECT queue_time_sec FROM paper_orders WHERE status='filled' AND queue_time_sec > 0"
+    ).fetchall()
+    if rows:
+        queue_times = [r[0] for r in rows]
+        avg_qt = sum(queue_times) / len(queue_times)
+        min_qt = min(queue_times)
+        max_qt = max(queue_times)
+        median_qt = sorted(queue_times)[len(queue_times) // 2]
+        lines.append(f"  Avg queue time:    {avg_qt:.1f}s")
+        lines.append(f"  Median:            {median_qt:.1f}s")
+        lines.append(f"  Min/Max:           {min_qt:.1f}s / {max_qt:.1f}s")
+
+        # Queue time buckets
+        buckets = [0, 30, 60, 120, 300]
+        for i, b in enumerate(buckets[:-1]):
+            count = sum(1 for qt in queue_times if b <= qt < buckets[i+1])
+            pct = count / len(queue_times) * 100
+            lines.append(f"    {b}-{buckets[i+1]}s: {count} ({pct:.0f}%)")
+        count_long = sum(1 for qt in queue_times if qt >= 300)
+        pct_long = count_long / len(queue_times) * 100
+        lines.append(f"    300s+: {count_long} ({pct_long:.0f}%)")
+    else:
+        lines.append("  No queue time data yet")
+
+    lines.append("")
+
+    # === 新增: Toxic Flow Analysis ===
+    lines.append("--- Toxic Flow Detection ---")
+    try:
+        toxic_fills = conn.execute(
+            "SELECT COUNT(*) FROM paper_orders WHERE status='filled' AND is_toxic=1"
+        ).fetchone()[0]
+        total_fills = filled_orders
+        toxic_pct = toxic_fills / total_fills * 100 if total_fills > 0 else 0
+        lines.append(f"  Toxic fills:       {toxic_fills}/{total_fills} ({toxic_pct:.1f}%)")
+
+        # VPIN correlation with adverse selection
+        rows = conn.execute(
+            "SELECT vpin_at_fill, mid_at_fill, mid_after_60s, side "
+            "FROM paper_orders WHERE status='filled' AND mid_after_60s > 0 AND vpin_at_fill > 0"
+        ).fetchall()
+        if rows:
+            high_vpin_adverse = 0
+            low_vpin_adverse = 0
+            high_vpin_count = 0
+            low_vpin_count = 0
+            for vpin, mid_fill, mid_60s, side in rows:
+                move = mid_60s - mid_fill
+                is_adverse = (side == "BUY" and move < 0) or (side == "SELL" and move > 0)
+                if vpin > 0.3:
+                    high_vpin_count += 1
+                    if is_adverse:
+                        high_vpin_adverse += 1
+                else:
+                    low_vpin_count += 1
+                    if is_adverse:
+                        low_vpin_adverse += 1
+
+            high_rate = high_vpin_adverse / high_vpin_count * 100 if high_vpin_count > 0 else 0
+            low_rate = low_vpin_adverse / low_vpin_count * 100 if low_vpin_count > 0 else 0
+            lines.append(f"  High VPIN (>0.3) adverse rate: {high_rate:.1f}% ({high_vpin_count} fills)")
+            lines.append(f"  Low VPIN (<=0.3) adverse rate: {low_rate:.1f}% ({low_vpin_count} fills)")
+    except sqlite3.OperationalError:
+        lines.append("  (toxic tracking columns not available)")
+
+    lines.append("")
+
     # Adverse selection analysis
     lines.append("--- Adverse Selection (60s post-fill) ---")
     rows = conn.execute(
@@ -532,25 +914,32 @@ def get_stats(db_path: Path = DB_PATH) -> str:
     if rows:
         adverse_count = 0
         total_adverse_move = 0.0
+        adverse_moves = []
         for side, price, mid_fill, mid_60s in rows:
-            if side == "BUY":
-                # Adverse = price dropped after we bought
-                move = mid_60s - mid_fill
-                if move < 0:
-                    adverse_count += 1
-                    total_adverse_move += abs(move)
-            else:
-                # Adverse = price rose after we sold
-                move = mid_60s - mid_fill
-                if move > 0:
-                    adverse_count += 1
-                    total_adverse_move += abs(move)
+            move = mid_60s - mid_fill
+            if side == "BUY" and move < 0:
+                adverse_count += 1
+                adverse_moves.append(abs(move))
+                total_adverse_move += abs(move)
+            elif side == "SELL" and move > 0:
+                adverse_count += 1
+                adverse_moves.append(abs(move))
+                total_adverse_move += abs(move)
 
         adverse_pct = adverse_count / len(rows) * 100
         avg_adverse = total_adverse_move / adverse_count if adverse_count > 0 else 0
         lines.append(f"  Fills with 60s data:  {len(rows)}")
         lines.append(f"  Adverse moves:        {adverse_count} ({adverse_pct:.1f}%)")
         lines.append(f"  Avg adverse move:     {avg_adverse:.4f}")
+
+        # Adverse move distribution
+        if adverse_moves:
+            percentiles = [50, 75, 90, 95]
+            sorted_moves = sorted(adverse_moves)
+            for p in percentiles:
+                idx = int(len(sorted_moves) * p / 100)
+                val = sorted_moves[min(idx, len(sorted_moves)-1)]
+                lines.append(f"    P{p} adverse move: {val:.4f}")
     else:
         lines.append("  No fill data with 60s measurements yet")
 
@@ -560,16 +949,17 @@ def get_stats(db_path: Path = DB_PATH) -> str:
     lines.append("--- Queue Depth at Fill ---")
     rows = conn.execute(
         "SELECT AVG(queue_depth), MIN(queue_depth), MAX(queue_depth), "
-        "AVG(size) FROM paper_orders WHERE status='filled'"
+        "AVG(size), AVG(queue_position) FROM paper_orders WHERE status='filled'"
     ).fetchone()
     if rows and rows[0] is not None:
-        avg_q, min_q, max_q, avg_size = rows
-        lines.append(f"  Avg queue depth:  {avg_q:.0f}")
-        lines.append(f"  Min/Max:          {min_q:.0f} / {max_q:.0f}")
-        lines.append(f"  Avg order size:   {avg_size:.0f}")
+        avg_q, min_q, max_q, avg_size, avg_pos = rows
+        lines.append(f"  Avg queue depth:    {avg_q:.0f}")
+        lines.append(f"  Avg queue position: {avg_pos or 0:.0f}")
+        lines.append(f"  Min/Max depth:      {min_q:.0f} / {max_q:.0f}")
+        lines.append(f"  Avg order size:     {avg_size:.0f}")
         if avg_q > 0:
             implied_fill_prob = avg_size / (avg_size + avg_q)
-            lines.append(f"  Implied fill prob: {implied_fill_prob:.1%}")
+            lines.append(f"  Implied fill prob:  {implied_fill_prob:.1%}")
 
     lines.append("")
 
@@ -598,6 +988,31 @@ def get_stats(db_path: Path = DB_PATH) -> str:
         trades_per_hour = (total_trades or 0) / hours
         lines.append(f"  {cid[:12]}... {trades_per_hour:.1f} trades/hr ({n_snaps} snapshots)")
 
+    lines.append("")
+
+    # === 新增: VPIN Statistics ===
+    lines.append("--- VPIN Statistics ---")
+    try:
+        snap_rows = conn.execute(
+            "SELECT AVG(vpin), MIN(vpin), MAX(vpin) FROM paper_snapshots WHERE vpin > 0"
+        ).fetchone()
+        if snap_rows and snap_rows[0]:
+            avg_vpin, min_vpin, max_vpin = snap_rows
+            lines.append(f"  Avg VPIN:     {avg_vpin:.3f}")
+            lines.append(f"  Min/Max:      {min_vpin:.3f} / {max_vpin:.3f}")
+
+            # VPIN distribution
+            high_vpin = conn.execute(
+                "SELECT COUNT(*) FROM paper_snapshots WHERE vpin > 0.35"
+            ).fetchone()[0]
+            total_snaps = conn.execute(
+                "SELECT COUNT(*) FROM paper_snapshots WHERE vpin > 0"
+            ).fetchone()[0]
+            high_pct = high_vpin / total_snaps * 100 if total_snaps > 0 else 0
+            lines.append(f"  High VPIN (>0.35): {high_pct:.1f}% of snapshots")
+    except sqlite3.OperationalError:
+        lines.append("  (VPIN columns not available)")
+
     conn.close()
     return "\n".join(lines)
 
@@ -606,6 +1021,7 @@ def get_calibration(db_path: Path = DB_PATH) -> dict:
     """Extract calibrated parameters for realistic backtesting.
 
     Returns a dict that can be plugged directly into the backtest model.
+    Enhanced with queue time, toxic flow, and VPIN metrics.
     """
     if not db_path.exists():
         return {"error": "No data. Run paper trader first."}
@@ -645,6 +1061,12 @@ def get_calibration(db_path: Path = DB_PATH) -> dict:
                 moves.append(abs(move))
         result["adverse_selection_rate"] = adverse / len(rows)
         result["avg_adverse_move"] = sum(moves) / len(moves) if moves else 0
+        # 添加adverse move分布
+        if moves:
+            sorted_moves = sorted(moves)
+            result["adverse_move_p50"] = sorted_moves[len(sorted_moves) // 2]
+            result["adverse_move_p90"] = sorted_moves[int(len(sorted_moves) * 0.9)]
+            result["adverse_move_p95"] = sorted_moves[int(len(sorted_moves) * 0.95)]
     else:
         result["adverse_selection_rate"] = 0.30  # fallback
         result["avg_adverse_move"] = 0.005
@@ -668,14 +1090,86 @@ def get_calibration(db_path: Path = DB_PATH) -> dict:
         result["avg_spread_cents"] = row[0] or 3.0
         result["avg_total_q"] = row[1] or 100.0
 
+    # === 新增: Queue Time 校准 ===
+    try:
+        rows = conn.execute(
+            "SELECT queue_time_sec FROM paper_orders WHERE status='filled' AND queue_time_sec > 0"
+        ).fetchall()
+        if rows:
+            queue_times = [r[0] for r in rows]
+            result["avg_queue_time_sec"] = sum(queue_times) / len(queue_times)
+            sorted_qt = sorted(queue_times)
+            result["queue_time_p50"] = sorted_qt[len(sorted_qt) // 2]
+            result["queue_time_p90"] = sorted_qt[int(len(sorted_qt) * 0.9)]
+
+            # Fill rate by queue time bucket
+            short_fills = sum(1 for qt in queue_times if qt < 60)
+            medium_fills = sum(1 for qt in queue_times if 60 <= qt < 180)
+            long_fills = sum(1 for qt in queue_times if qt >= 180)
+            result["fill_rate_by_queue_time"] = {
+                "under_60s": short_fills / len(queue_times) if queue_times else 0,
+                "60_180s": medium_fills / len(queue_times) if queue_times else 0,
+                "over_180s": long_fills / len(queue_times) if queue_times else 0,
+            }
+    except sqlite3.OperationalError:
+        pass
+
+    # === 新增: Toxic Flow 校准 ===
+    try:
+        toxic_fills = conn.execute(
+            "SELECT COUNT(*) FROM paper_orders WHERE status='filled' AND is_toxic=1"
+        ).fetchone()[0]
+        result["toxic_fill_rate"] = toxic_fills / filled if filled > 0 else 0
+
+        # VPIN和adverse selection的关联
+        rows = conn.execute(
+            "SELECT vpin_at_fill, mid_at_fill, mid_after_60s, side "
+            "FROM paper_orders WHERE status='filled' AND mid_after_60s > 0 AND vpin_at_fill > 0"
+        ).fetchall()
+        if rows:
+            high_vpin_adverse = 0
+            high_vpin_count = 0
+            low_vpin_adverse = 0
+            low_vpin_count = 0
+            for vpin, mid_fill, mid_60s, side in rows:
+                move = mid_60s - mid_fill
+                is_adverse = (side == "BUY" and move < 0) or (side == "SELL" and move > 0)
+                if vpin > 0.3:
+                    high_vpin_count += 1
+                    if is_adverse:
+                        high_vpin_adverse += 1
+                else:
+                    low_vpin_count += 1
+                    if is_adverse:
+                        low_vpin_adverse += 1
+
+            result["adverse_rate_high_vpin"] = high_vpin_adverse / high_vpin_count if high_vpin_count > 0 else 0
+            result["adverse_rate_low_vpin"] = low_vpin_adverse / low_vpin_count if low_vpin_count > 0 else 0
+    except sqlite3.OperationalError:
+        pass
+
+    # === 新增: VPIN 统计 ===
+    try:
+        row = conn.execute(
+            "SELECT AVG(vpin), AVG(trade_imbalance) FROM paper_snapshots WHERE vpin > 0"
+        ).fetchone()
+        if row and row[0]:
+            result["avg_vpin"] = row[0]
+            result["avg_trade_imbalance"] = row[1]
+    except sqlite3.OperationalError:
+        pass
+
     conn.close()
 
-    # Summary
+    # Enhanced Summary
+    toxic_rate = result.get('toxic_fill_rate', 0)
+    queue_time = result.get('avg_queue_time_sec', 0)
     result["_summary"] = (
         f"Fill prob: {result.get('pro_rata_fill_prob', 0):.1%} | "
         f"Adverse: {result.get('adverse_selection_rate', 0):.0%} | "
-        f"Trades/hr: {result.get('avg_trades_per_hour', 0):.1f} | "
-        f"Queue: {result.get('avg_queue_depth', 0):.0f}"
+        f"Toxic: {toxic_rate:.0%} | "
+        f"Queue: {queue_time:.0f}s | "
+        f"Trades/hr: {result.get('avg_trades_per_hour', 0):.1f}"
     )
 
     return result
@@ -697,7 +1191,7 @@ def run_historical_replay(top_n: int = 5):
     import os
     import random
 
-    os.chdir("/workspace/mantis")
+    os.chdir(str(_MODULE_DIR))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 
     config = load_config("config.yaml")
@@ -709,7 +1203,7 @@ def run_historical_replay(top_n: int = 5):
     logger.info(f"Found {len(markets)} markets")
 
     # Use a separate DB for historical data
-    hist_db_path = Path("/workspace/mantis/data/paper_trades_hist.db")
+    hist_db_path = _MODULE_DIR / "data" / "paper_trades_hist.db"
     conn = init_db(hist_db_path)
     # Clear old data
     conn.executescript("DELETE FROM paper_orders; DELETE FROM paper_snapshots; DELETE FROM paper_trades_seen;")
@@ -944,7 +1438,7 @@ def run_paper_trader(top_n: int = 5, interval: int = 30):
     )
 
     import os
-    os.chdir("/workspace/mantis")
+    os.chdir(str(_MODULE_DIR))
 
     config = load_config("config.yaml")
     client = PolymarketClient()
@@ -1022,7 +1516,7 @@ if __name__ == "__main__":
     if args.stats:
         print(get_stats())
     elif args.stats_hist:
-        print(get_stats(Path("/workspace/mantis/data/paper_trades_hist.db")))
+        print(get_stats(_MODULE_DIR / "data" / "paper_trades_hist.db"))
     elif args.calibrate:
         import json as _json
         params = get_calibration()

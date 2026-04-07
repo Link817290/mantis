@@ -28,6 +28,18 @@ engine:
   markov_window: 20            # Price history window for Markov
   gm_lookback_fills: 50        # Recent fills for Glosten-Milgrom
 
+  # 防吃单配置
+  vpin_toxic_threshold: 0.35   # VPIN 超过此值认为订单流有毒，加宽价差
+  retreat_momentum_threshold: 0.5  # 价格动量超过此值触发撤单
+  price_jitter_cents: 0.15     # 价格随机抖动（防止被预测）
+  size_jitter_pct: 0.1         # 订单大小随机抖动
+
+  # 被吃单后的平仓配置
+  unwind_min_profit_pct: 0.005   # 正常情况目标利润 0.5%
+  unwind_max_loss_pct: 0.03      # 最大可接受亏损 3%（超过则止损）
+  unwind_time_decay_hours: 4.0   # 持仓超过4小时后降低利润要求
+  unwind_urgent_loss_pct: 0.05   # 紧急止损线 5%（立即市价平仓）
+
 risk:
   max_drawdown: 0.15           # 15% max drawdown from peak
   daily_loss_limit: 3.0        # $3 daily loss limit

@@ -18,7 +18,8 @@ class WalletConfig:
 class MarketsConfig:
     max_active: int = 5
     allocation: list[int] = field(default_factory=lambda: [30, 25, 20, 15, 10])
-    scan_interval_min: int = 60
+    scan_interval_min: int = 10  # Scan every 10 minutes for market migration
+    quick_scan_interval_min: int = 5  # Quick midpoint check every 5 minutes
 
 
 @dataclass
@@ -29,6 +30,8 @@ class ScannerConfig:
     max_min_size: int = 50
     min_reward_rate: float = 1.0
     migrate_threshold: float = 1.5
+    min_quality_score: float = 0.3  # Reject markets with quality < 0.3
+    min_activity_score: float = 0.2  # Reject dead markets
 
 
 @dataclass
@@ -42,6 +45,24 @@ class EngineConfig:
     reward_mode: bool = False  # Pure reward farming: tight spread, min_size
     reward_spread_pct: float = 0.15  # Order distance = 15% of max_spread (defiance_cr)
     post_fill_cooldown_sec: int = 60  # Cooldown after a fill before replaying that side
+
+    # 防吃单配置
+    vpin_toxic_threshold: float = 0.35  # VPIN 超过此值认为有毒
+    retreat_momentum_threshold: float = 0.5  # 动量超过此值触发撤单
+    price_jitter_cents: float = 0.15  # 价格随机抖动范围（分）
+    size_jitter_pct: float = 0.1  # 订单大小随机抖动比例
+
+    # 平仓配置
+    unwind_min_profit_pct: float = 0.005  # 最小期望利润 0.5%
+    unwind_max_loss_pct: float = 0.03  # 最大可接受亏损 3%
+    unwind_time_decay_hours: float = 4.0  # 时间衰减：4小时后降低利润要求
+    unwind_urgent_loss_pct: float = 0.05  # 紧急止损线 5%
+
+    # 滑点保护配置
+    orderbook_max_age_sec: float = 5.0  # 订单簿最大有效期（秒）
+    slippage_buffer_cents: float = 0.3  # 报价安全边距（分）
+    capital_safety_margin: float = 0.05  # 资金安全边际 5%
+    max_slippage_cents: float = 1.0  # 最大可接受滑点（分）
 
 
 @dataclass

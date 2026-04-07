@@ -105,6 +105,36 @@ class PolymarketClient:
         logger.info(f"Fetched {len(all_markets)} sampling markets")
         return all_markets
 
+    # ── Quick Price (Midpoint API - 更轻量) ──
+
+    def fetch_midpoint(self, token_id: str) -> float | None:
+        """快速获取中间价（比获取整个订单簿更轻量）。"""
+        url = f"{CLOB_BASE}/midpoint"
+        try:
+            resp = self._http.get(url, params={"token_id": token_id}, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            return float(data.get("mid", data.get("mid_price", 0)))
+        except Exception as e:
+            logger.debug(f"Midpoint fetch failed: {e}")
+            return None
+
+    def fetch_spread(self, token_id: str) -> dict | None:
+        """获取最优买卖价和价差。"""
+        url = f"{CLOB_BASE}/spread"
+        try:
+            resp = self._http.get(url, params={"token_id": token_id}, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "bid": float(data.get("bid", 0)),
+                "ask": float(data.get("ask", 0)),
+                "spread": float(data.get("spread", 0)),
+            }
+        except Exception as e:
+            logger.debug(f"Spread fetch failed: {e}")
+            return None
+
     # ── Orderbook ──
 
     def fetch_orderbook(self, token_id: str) -> Orderbook:
@@ -254,3 +284,174 @@ class PolymarketTrader:
         """Get recent trades (authenticated)."""
         self._ensure_client()
         return self._client.get_trades() or []
+
+    # ── Heartbeat (防止订单被自动取消) ──
+
+    def send_heartbeat(self) -> bool:
+        """发送心跳保持会话活跃。
+
+        重要：如果不定期发送心跳，所有订单会被自动取消！
+        建议每 30 秒发送一次。
+        """
+        self._ensure_client()
+        try:
+            # py-clob-client 可能没有直接的 heartbeat 方法
+            # 使用底层 HTTP 调用
+            import hmac
+            import hashlib
+            import base64
+
+            ts = str(int(time.time()))
+            api_key = self._client.creds.api_key
+            api_secret = self._client.creds.api_secret
+            api_passphrase = self._client.creds.api_passphrase
+
+            # 签名
+            message = ts + "POST" + "/heartbeats"
+            signature = base64.b64encode(
+                hmac.new(
+                    base64.b64decode(api_secret),
+                    message.encode('utf-8'),
+                    hashlib.sha256
+                ).digest()
+            ).decode()
+
+            headers = {
+                "POLY_API_KEY": api_key,
+                "POLY_ADDRESS": self._client.get_address(),
+                "POLY_SIGNATURE": signature,
+                "POLY_PASSPHRASE": api_passphrase,
+                "POLY_TIMESTAMP": ts,
+            }
+
+            resp = httpx.post(
+                f"{CLOB_BASE}/heartbeats",
+                headers=headers,
+                timeout=5,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.debug(f"Heartbeat failed: {e}")
+            return False
+
+    # ── 批量操作 ──
+
+    def create_multiple_orders(self, orders: list[dict]) -> list[dict]:
+        """批量下单（最多15个）。
+
+        orders: list of {token_id, side, price, size}
+        Returns: list of order responses
+        """
+        self._ensure_client()
+        if len(orders) > 15:
+            raise ValueError("Maximum 15 orders per batch")
+
+        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.order_builder.constants import BUY, SELL
+
+        built_orders = []
+        for o in orders:
+            order_side = BUY if o["side"] == "BUY" else SELL
+            order_args = OrderArgs(
+                token_id=o["token_id"],
+                price=o["price"],
+                size=o["size"],
+                side=order_side,
+            )
+            built_orders.append(self._client.create_order(order_args))
+
+        t0 = time.time()
+        # py-clob-client 的批量接口
+        try:
+            result = self._client.post_orders(built_orders)
+        except AttributeError:
+            # 如果没有 post_orders 方法，回退到单个下单
+            result = [self._client.post_order(o) for o in built_orders]
+
+        slog.api_call(
+            method="POST", endpoint="post_orders",
+            latency_ms=(time.time() - t0) * 1000,
+            n_orders=len(orders),
+        )
+        logger.info(f"Batch order placed: {len(orders)} orders")
+        return result
+
+    def cancel_orders(self, order_ids: list[str]) -> dict:
+        """批量取消订单（最多3000个）。"""
+        self._ensure_client()
+        if not order_ids:
+            return {"cancelled": 0}
+
+        t0 = time.time()
+        try:
+            result = self._client.cancel_orders(order_ids)
+        except AttributeError:
+            # 回退到逐个取消
+            for oid in order_ids:
+                try:
+                    self._client.cancel(oid)
+                except Exception:
+                    pass
+            result = {"cancelled": len(order_ids)}
+
+        slog.api_call(
+            method="DELETE", endpoint="cancel_orders",
+            latency_ms=(time.time() - t0) * 1000,
+            n_orders=len(order_ids),
+        )
+        logger.info(f"Batch cancel: {len(order_ids)} orders")
+        return result
+
+    def cancel_market_orders(self, market_id: str = "", asset_id: str = "") -> dict:
+        """取消特定市场的所有订单。
+
+        market_id: condition_id
+        asset_id: token_id
+        """
+        self._ensure_client()
+        t0 = time.time()
+        try:
+            result = self._client.cancel_market_orders(
+                market=market_id,
+                asset_id=asset_id,
+            )
+        except AttributeError:
+            # 回退：获取所有订单然后过滤取消
+            all_orders = self.get_open_orders()
+            to_cancel = [
+                o.get("id", o.get("orderID", ""))
+                for o in all_orders
+                if (not market_id or o.get("market") == market_id) and
+                   (not asset_id or o.get("asset_id") == asset_id)
+            ]
+            for oid in to_cancel:
+                try:
+                    self._client.cancel(oid)
+                except Exception:
+                    pass
+            result = {"cancelled": len(to_cancel)}
+
+        slog.api_call(
+            method="DELETE", endpoint="cancel_market_orders",
+            latency_ms=(time.time() - t0) * 1000,
+            market_id=market_id[:16] if market_id else "",
+        )
+        return result
+
+    def get_order(self, order_id: str) -> dict | None:
+        """获取单个订单详情。"""
+        self._ensure_client()
+        try:
+            return self._client.get_order(order_id)
+        except Exception:
+            return None
+
+    def get_orders_for_market(self, market_id: str) -> list[dict]:
+        """获取特定市场的所有挂单。"""
+        self._ensure_client()
+        try:
+            return self._client.get_orders(market=market_id) or []
+        except Exception:
+            # 回退：获取所有订单然后过滤
+            all_orders = self.get_open_orders()
+            return [o for o in all_orders if o.get("market") == market_id]
